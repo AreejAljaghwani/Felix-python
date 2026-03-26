@@ -4,11 +4,11 @@ import sympy as sp
 import subprocess
 import numpy as np
 from scipy.constants import c
-from scipy.linalg import eig, inv
+from scipy.linalg import eig, solve
 from CifFile import CifFile
 import struct
 from pylix_modules import pylix_dicts as fu
-from numba import njit, prange
+import matplotlib.pyplot as plt
 import math
 
 
@@ -48,14 +48,14 @@ def read_inp_file(filename):
     return inp_dict
 
 
-def read_hkl_file(filename):
+def read_hkl_file(hkl, filename):
     """
     Reads in the file felix.hkl and returns the list of reflexions to output
 
     Parameters:
     filename (str): The path to the input file.
     Returns:
-    inp_dict: A dictionary with variable names and values.
+    hkl.input_hkls, hkl.i_obs, hkl.sigma_obs altered in place
     """
     input_hkls = []
     i_obs = []
@@ -88,10 +88,13 @@ def read_hkl_file(filename):
 
     # Convert lists to numpy arrays
     input_hkls = np.array(input_hkls, dtype=int)
-    i_obs = np.array(i_obs) if cRED else None
-    sigma_obs = np.array(sigma_obs) if cRED else None
+    # remove [0,0,0] if it is present
+    mask = ~np.all(input_hkls == 0, axis=1)
+    hkl.input_hkls = input_hkls[mask]
+    hkl.i_obs = np.array(i_obs) if cRED else None
+    hkl.sigma_obs = np.array(sigma_obs) if cRED else None
 
-    return input_hkls, i_obs, sigma_obs
+    return
 
 
 def extract_cif_parameter(item):
@@ -287,65 +290,60 @@ def symop_convert(symop_xyz):
     return mat, vec
 
 
-def unique_atom_positions(symmetry_matrix, symmetry_vector, basis_atom_label, basis_atom_type_label,
-                          basis_atom_name, basis_atom_position, basis_u_ij,
-                          basis_occupancy, basis_pv, basis_kappa, debug):
+def unique_atom_positions(xtal, basis, cell, rc):
     """
     Fills the unit cell by applying symmetry operations to the basis
 
     Parameters:
-    symmetry_matrix float(n_symmetry_operations x 3x3): n_symmetry_operations
-    symmetry_vector float(n_symmetry_operations x 3):  associated translations
-    basis_atom_label (str): a label for each basis atom
-    basis_atom_name (str): element symbol for each basis atom
-    basis_atom_position float(n_basis_atoms x 3): fractional coordinates
-    basis_u_ij float(n_basis_atoms, 3, 3): anisotropic displacement parameter tensor for each basis atom
-    basis_occupancy float(n_basis_atoms): occupancy for each basis atom
+    xtal.symmetry_matrix float(n_symops x 3x3): n_symops
+    xtal.symmetry_vector float(n_symops x 3):  associated translations
+    basis.atom_label (str): a label for each basis atom
+    basis.atom_name (str): element symbol for each basis atom
+    basis.atom_position float(basis.n_atoms x 3): fractional coordinates
+    basis.u_aniso float(basis.n_atoms, 3, 3): anisotropic displacement parameter tensor
+    basis.occupancy float(basis.n_atoms): occupancy for each basis atom
 
     Returns:
-    atom_position, atom_label, atom_name, B_iso, occupancy
+    cell.atom_position, cell.atom_label, cell.atom_name, etc
     """
-    if debug:
-        np.set_printoptions(precision=5, suppress=True)
-        for i in range(3):
-            print(f"Basis anisotropic u_ij [{i}]")
-            print(f"{basis_u_ij[i, :5, :5]}")
-
     # tolerance in fractional coordinates to consider atoms to be the same
     tol = 0.000001
     # Determine the size of the all_atom_position array
-    n_symmetry_operations = symmetry_vector.shape[0]
-    n_basis_atoms = basis_atom_position.shape[0]
-    total_atoms = n_symmetry_operations * n_basis_atoms
+    n_symops = xtal.symmetry_vector.shape[0]
+    total_atoms = n_symops * basis.n_atoms
+    if rc.debug:
+        np.set_printoptions(precision=5, suppress=True)
+        for i in range(basis.n_atoms):
+            print(f"Basis anisotropic u_aniso [{i}]")
+            print(f"{basis.u_aniso[i, :5, :5]}")
+
 
     # Initialize arrays to store all atom positions, including duplicates
-    all_atom_label = np.tile(basis_atom_label, n_symmetry_operations)
-    # print (basis_atom_type_label)
-
-    all_atom_type_label = np.tile(basis_atom_type_label, n_symmetry_operations)
-
-    all_atom_name = np.tile(basis_atom_name, n_symmetry_operations)
+    all_atom_label = np.tile(basis.atom_label, n_symops)
+    all_atom_name = np.tile(basis.atom_name, n_symops)
     # print(all_atom_name)
-    all_occupancy = np.tile(basis_occupancy, n_symmetry_operations)
-    all_kappa = np.tile(basis_kappa, n_symmetry_operations)
-    all_pv = np.tile(basis_pv, n_symmetry_operations)
+    all_occupancy = np.tile(basis.occupancy, n_symops)
+    if rc.scatter_factor_method == 4:
+        all_kappa = np.tile(basis.kappa, n_symops)
+        all_pv = np.tile(basis.pv, n_symops)
+        all_mean_sq_r2 = np.tile(basis.mean_sq_r2, n_symops)
 
     # Generate all equivalent positions by applying symmetry
     symmetry_applied = \
-        np.einsum('ijk,lk->ilj', symmetry_matrix, basis_atom_position) +\
-        symmetry_vector[:, np.newaxis, :]
+        np.einsum('ijk,lk->ilj', xtal.symmetry_matrix, basis.atom_position) +\
+        xtal.symmetry_vector[:, np.newaxis, :]
     all_atom_position = symmetry_applied.reshape(total_atoms, 3)
 
     # Anisotropic Displacement Parameters, ADPs
-    # apply symops to u_ij's, size [n_symmetry_operations, n_basis_atoms, 3, 3]
-    tmp = np.matmul(symmetry_matrix[:, None], basis_u_ij[None, :])
-    # array of inverse operations, size [n_symmetry_operations, 3, 3]
+    # apply symops to u_aniso's, size [n_symops, basis.n_atoms, 3, 3]
+    tmp = np.matmul(xtal.symmetry_matrix[:, None], basis.u_aniso[None, :])
+    # array of inverse operations, size [n_symops, 3, 3]
     # NB we can't use the transpose as symops are not always orthonormal
-    Minv = np.linalg.inv(symmetry_matrix)
-    # finsh the calculation, size [n_symmetry_operations, n_basis_atoms, 3, 3]
-    all_u_ij = np.matmul(tmp, Minv[:, None])
-    # reshape, size [n_symmetry_operations*n_basis_atoms, 3, 3]
-    all_u_ij = all_u_ij.reshape(-1, 3, 3)
+    Minv = np.linalg.inv(xtal.symmetry_matrix)
+    # finsh the calculation, size [n_symops, basis.n_atoms, 3, 3]
+    all_u_aniso = np.matmul(tmp, Minv[:, None])
+    # reshape, size [n_symops*basis.n_atoms, 3, 3]
+    all_u_aniso = all_u_aniso.reshape(-1, 3, 3)
 
     # Normalize positions to be within [0, 1]
     all_atom_position %= 1.0
@@ -364,59 +362,68 @@ def unique_atom_positions(symmetry_matrix, symmetry_vector, basis_atom_label, ba
             unique_mask &= (dist_matrix[j] > tol)
 
     # Apply the same reduction to the labels, names, occupancies, and B_iso
-    atom_position = all_atom_position[i]
-    atom_label = all_atom_label[i]
-    atom_type = all_atom_type_label[i]
-    atom_name = all_atom_name[i]
-    occupancy = all_occupancy[i]
-    u_ij = all_u_ij[i]
-    kappa = all_kappa[i]
-    pv = all_pv[i]
-    if debug:
+    cell.atom_position = all_atom_position[i]
+    cell.atom_label = all_atom_label[i]
+    cell.atom_name = all_atom_name[i]
+    cell.occupancy = all_occupancy[i]
+    cell.u_aniso = all_u_aniso[i]
+    # Generate atomic numbers based on the elemental symbols
+    cell.atomic_number = np.array([fu.atomic_number_map[na]
+                                   for na in cell.atom_name])
+
+    if rc.scatter_factor_method == 4:
+        cell.kappa = all_kappa[i]
+        cell.pv = all_pv[i]
+        cell.mean_sq_r2 = all_mean_sq_r2[i]
+    cell.n_atoms = len(cell.atom_name)
+    if rc.debug:
         np.set_printoptions(precision=5, suppress=True)
         for i in range(3):
-            print(f"Anisotropic u_ij [{i}]")
-            print(f"{u_ij[i, :5, :5]}")
+            print(f"Anisotropic u_aniso [{i}]")
+            print(f"{cell.u_aniso[i, :5, :5]}")
 
-    return atom_position, atom_label,atom_type, atom_name, u_ij, occupancy, pv, kappa
+    return
 
 
-def reference_frames(cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma,
-                     space_group, x_dir_c, z_dir_c, norm_dir_c, debug):
+def reference_frames(xtal, cell, rc):
+# def reference_frames(cell_a, xtal.cell_b, xtal.cell_c, xtal.cell_alpha, xtal.cell_beta, xtal.cell_gamma,
+#                      space_group, rc.x_direction, rc.z_direction, norm_dir_c, debug):
     """
     Produces reciprocal lattice vectors and related parameters
 
     Parameters:
     space_group : str
         Space group name (will be modified in some cases).
-    cell_alpha, cell_beta, cell_gamma : float
+    xtal.cell_alpha, xtal.cell_beta, cell_gamma : float
         Lattice angles in radians.
-    cell_a, cell_b, cell_c : float
+    xtal.cell_a, xtal.cell_b, xtal.cell_c : float
         Lattice lengths in Angstroms.
-    z_dir_c : ndarray
+    rc.incident_beam_direction : ndarray
         Direct lattice vector that defines the beam direction.
-    x_dir_c : ndarray
+    rc.x_direction : ndarray
         Reciprocal lattice vector that defines the x-axis of the diffraction
         pattern.
-    norm_dir_c : ndarray
+    rc.normal : ndarray
         Normal direction in the crystal reference frame.
     """
 
     tiny = 1e-10
 
     # Direct lattice vectors in an orthogonal reference frame, Angstrom units
-    a_vec_o = np.array([cell_a, 0.0, 0.0])  # x_o is // to a
-    b_vec_o = np.array([cell_b * np.cos(cell_gamma),
-                        cell_b * np.sin(cell_gamma), 0.0])
+    a_vec_o = np.array([xtal.cell_a, 0.0, 0.0])  # x_o is // to a
+    b_vec_o = np.array([xtal.cell_b * np.cos(xtal.cell_gamma),
+                        xtal.cell_b * np.sin(xtal.cell_gamma), 0.0])
     c_vec_o = np.array([
-        cell_c * np.cos(cell_beta),
-        cell_c * (np.cos(cell_alpha) - np.cos(cell_beta) *
-                  np.cos(cell_gamma)) / np.sin(cell_gamma),
-        cell_c * np.sqrt(1.0 - np.cos(cell_alpha)**2 -
-                         np.cos(cell_beta)**2 - np.cos(cell_gamma)**2 +
-                         2.0 * np.cos(cell_alpha) *
-                         np.cos(cell_beta) * np.cos(cell_gamma)) /
-        np.sin(cell_gamma)])
+        xtal.cell_c * np.cos(xtal.cell_beta),
+        xtal.cell_c * (np.cos(xtal.cell_alpha) - np.cos(xtal.cell_beta) *
+                       np.cos(xtal.cell_gamma)) / np.sin(xtal.cell_gamma),
+        xtal.cell_c * np.sqrt(1.0 - np.cos(xtal.cell_alpha)**2 -
+                              np.cos(xtal.cell_beta)**2 -
+                              np.cos(xtal.cell_gamma)**2 +
+                              2.0 * np.cos(xtal.cell_alpha) *
+                              np.cos(xtal.cell_beta) *
+                              np.cos(xtal.cell_gamma)) /
+        np.sin(xtal.cell_gamma)])
 
     # Some checks for rhombohedral cells
     # if diffraction_flag == 0:
@@ -449,48 +456,54 @@ def reference_frames(cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma,
     cr_vec_o[np.abs(cr_vec_o) < tiny] = 0.0
 
     # Transformation matrix from crystal to orthogonal reference frame
-    t_mat_c2o = np.column_stack((a_vec_o, b_vec_o, c_vec_o))
+    xtal.t_mat_c2o = np.column_stack((a_vec_o, b_vec_o, c_vec_o))
     # And the same for reciprocal frames
     t_mat_cr2or = np.column_stack((ar_vec_o, br_vec_o, cr_vec_o))
 
     # Unit reciprocal lattice vectors in orthogonal frame
-    x_dir_o = t_mat_cr2or @ x_dir_c
+    x_dir_o = t_mat_cr2or @ rc.x_direction
     x_dir_o /= np.linalg.norm(x_dir_o)
-    z_dir_o = t_mat_c2o @ z_dir_c
+    z_dir_o = xtal.t_mat_c2o @ rc.incident_beam_direction
     z_dir_o /= np.linalg.norm(z_dir_o)
     y_dir_o = np.cross(z_dir_o, x_dir_o)
 
     # Transformation matrix from orthogonal to microscope reference frame
-    t_mat_o2m = np.column_stack((x_dir_o, y_dir_o, z_dir_o)).T
+    xtal.t_mat_o2m = np.column_stack((x_dir_o, y_dir_o, z_dir_o)).T
 
     # Unit normal to the specimen in microscope frame
-    norm_dir_m = t_mat_o2m @ t_mat_c2o @ norm_dir_c
-    norm_dir_m /= np.linalg.norm(norm_dir_m)
+    xtal.norm_dir_m = xtal.t_mat_o2m @ xtal.t_mat_c2o @ rc.normal
+    xtal.norm_dir_m /= np.linalg.norm(xtal.norm_dir_m)
 
     # Transform from crystal reference frame to microscope frame
-    a_vec_m = t_mat_o2m @ a_vec_o
-    b_vec_m = t_mat_o2m @ b_vec_o
-    c_vec_m = t_mat_o2m @ c_vec_o
+    xtal.a_vec_m = xtal.t_mat_o2m @ a_vec_o
+    xtal.b_vec_m = xtal.t_mat_o2m @ b_vec_o
+    xtal.c_vec_m = xtal.t_mat_o2m @ c_vec_o
 
     # Reciprocal lattice vectors: microscope frame in 1/Angstrom units
-    ar_vec_m = (2.0*np.pi * np.cross(b_vec_m, c_vec_m) /
-                np.dot(a_vec_m, np.cross(b_vec_m, c_vec_m)))
-    br_vec_m = (2.0*np.pi * np.cross(c_vec_m, a_vec_m) /
-                np.dot(b_vec_m, np.cross(c_vec_m, a_vec_m)))
-    cr_vec_m = (2.0*np.pi * np.cross(a_vec_m, b_vec_m) /
-                np.dot(c_vec_m, np.cross(a_vec_m, b_vec_m)))
+    xtal.ar_vec_m = (2.0*np.pi * np.cross(xtal.b_vec_m, xtal.c_vec_m) /
+                np.dot(xtal.a_vec_m, np.cross(xtal.b_vec_m, xtal.c_vec_m)))
+    xtal.br_vec_m = (2.0*np.pi * np.cross(xtal.c_vec_m, xtal.a_vec_m) /
+                np.dot(xtal.b_vec_m, np.cross(xtal.c_vec_m, xtal.a_vec_m)))
+    xtal.cr_vec_m = (2.0*np.pi * np.cross(xtal.a_vec_m, xtal.b_vec_m) /
+                np.dot(xtal.c_vec_m, np.cross(xtal.a_vec_m, xtal.b_vec_m)))
+
+    # put the crystal in the micrcoscope reference frame, in Å
+    cell.atom_coordinate = (cell.atom_position[:, 0, np.newaxis]*xtal.a_vec_m +
+                            cell.atom_position[:, 1, np.newaxis]*xtal.b_vec_m +
+                            cell.atom_position[:, 2, np.newaxis]*xtal.c_vec_m)
+
 
     # Output to check
-    if debug:
+    if rc.debug:
         print(" ")
         np.set_printoptions(precision=5, suppress=True)
-        print(f"a = {cell_a}, b = {cell_b}, c = {cell_c}")
-        print(f"alpha = {cell_alpha*180.0/np.pi:.2f}, beta = {cell_beta*180.0/np.pi:.2f}, gamma = {cell_gamma*180.0/np.pi:.2f}")
-        print(f"X = {x_dir_c} (reciprocal space)")
-        print(f"Z = {z_dir_c} (direct space)")
+        print(f"a = {xtal.cell_a}, b = {xtal.cell_b}, c = {xtal.cell_c}")
+        print(f"alpha = {xtal.cell_alpha*180.0/np.pi:.2f}, beta = {xtal.cell_beta*180.0/np.pi:.2f}, gamma = {xtal.cell_gamma*180.0/np.pi:.2f}")
+        print(f"X = {rc.x_direction} (reciprocal space)")
+        print(f"Z = {rc.incident_beam_direction} (direct space)")
         print(" ")
         print("Transformation crystal to orthogonal (O) frame:")
-        print(t_mat_c2o)
+        print(xtal.t_mat_c2o)
         print(t_mat_cr2or)
         print("O frame:")
         print(f" a = {a_vec_o}")
@@ -505,20 +518,21 @@ def reference_frames(cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma,
         print(f" Z = {z_dir_o}")
         print(" ")
         print("Transformation orthogonal to microscope frame:")
-        print(t_mat_o2m)
+        print(xtal.t_mat_o2m)
         print("Microscope frame:")
-        print(f" a = {a_vec_m}")
-        print(f" b = {b_vec_m}")
-        print(f" c = {c_vec_m}")
-        print(f" a* = {ar_vec_m}")
-        print(f" b* = {br_vec_m}")
-        print(f" c* = {cr_vec_m}")
-        print(f"Specimen surface normal = {norm_dir_m}")
+        print(f" a = {xtal.a_vec_m}")
+        print(f" b = {xtal.b_vec_m}")
+        print(f" c = {xtal.c_vec_m}")
+        print(f" a* = {xtal.ar_vec_m}")
+        print(f" b* = {xtal.br_vec_m}")
+        print(f" c* = {xtal.cr_vec_m}")
+        print(f"Specimen surface normal = {xtal.norm_dir_m}")
 
-    return a_vec_m, b_vec_m, c_vec_m, ar_vec_m, br_vec_m, cr_vec_m, norm_dir_m, t_mat_o2m, t_mat_c2o
+    # return a_vec_m, b_vec_m, c_vec_m, ar_vec_m, br_vec_m, cr_vec_m, norm_dir_m, t_mat_o2m, t_mat_c2o
+    return
 
 
-def change_origin(space_group, basis_atom_position, basis_wyckoff):
+def change_origin(basis, space_group):
     """
     Change to the preferred origin for a given space group.
 
@@ -526,10 +540,9 @@ def change_origin(space_group, basis_atom_position, basis_wyckoff):
     space_group (int): The space group number.
 
     Returns:
-    basis_atom_position (ndarray): the updated basis atom fractional coords.
+    xtal.basis.basis_atom_position is mutated in place
     """
     change_flag = 0
-    n_basis_atoms = basis_atom_position.shape[0]  # Number of basis atoms
 
     # Only needed for space group #142 (I41/acd) so far
     # will be needed for others with origin choices!!!
@@ -537,32 +550,41 @@ def change_origin(space_group, basis_atom_position, basis_wyckoff):
         # Change from choice 1 (origin -4 at [0,0,0])
         # to choice 2 (origin -1 at [0,0,0])
         # Look for an 'a' site incompatible with choice 2
-        for i in range(n_basis_atoms):
+        for i in range(basis.n_atoms):
             # 'a' is -4 at [000],[0,1/2,1/2],[0,1/2,1/4],[1/2,0,1/4] in 1
             # and [0,1/4,3/8], [0,3/4,5/8], [1/2,1/4,5/8], [1/2,3/4,5/8] in 2
-            if basis_wyckoff[i] == 'a':
+            if basis.basis_wyckoff[i] == 'a':
                 # Check for origin 1
                 # by multiplying by 4 and checking if it is an integer
-                if np.mod(4 * basis_atom_position[i, 2], 1.0) < 1e-10:
+                if np.mod(4 * basis.basis_atom_position[i, 2], 1.0) < 1e-10:
                     change_flag = 1
         # add [0,1/4,3/8] if change_flag is set
         if change_flag == 1:
-            basis_atom_position[:, 1] = np.mod(basis_atom_position[:, 1]
+            basis.atom_position[:, 1] = np.mod(basis.atom_position[:, 1]
                                                + 0.25, 1.0)
-            basis_atom_position[:, 2] = np.mod(basis_atom_position[:, 2]
+            basis.atom_position[:, 2] = np.mod(basis.atom_position[:, 2]
                                                + 0.375, 1.0)
-    return basis_atom_position
+    return
 
 
-def preferred_basis(space_group, basis_atom_position, basis_wyckoff):
+def preferred_basis(basis, space_group):
+    """
+    Change to the preferred origin for a given space group, depending on each
+    atom's wyckoff symbol.  This is necesaary for coordinate refinement to work
+    correctly
 
-    n_basis_atoms = len(basis_atom_position)
-    basis_atom_position = change_origin(space_group, basis_atom_position,
-                                        basis_wyckoff)
+    Parameters:
+    space_group (int): The space group number.
+
+    Returns:
+    basis.atom_position is mutated in place
+    """
+
+    change_origin(basis, space_group)
 
     # Loop over basis atoms
-    for i in range(n_basis_atoms):
-        wyckoff_symbol = basis_wyckoff[i]
+    for i in range(basis.n_atoms):
+        wyckoff_symbol = basis.wyckoff[i]
 
         if space_group == 1:  # P1
             if wyckoff_symbol != 'a':
@@ -689,17 +711,17 @@ def preferred_basis(space_group, basis_atom_position, basis_wyckoff):
                 pass  # no reassignment needed
             elif wyckoff_symbol == 'd':
                 # Change equivalent coordinate [x,-x,z] to [x,x,z]
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             elif wyckoff_symbol == 'e':
                 # Change equivalent coordinate [0,x,z] to [x,0,z]
-                if abs(basis_atom_position[i, 0]) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.0
+                if abs(basis.atom_position[i, 0]) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.0
             elif wyckoff_symbol == 'f':
                 # Change equivalent coordinate [1/2,x,z] to [x,1/2,z]
-                if abs(basis_atom_position[i, 0] - 0.5) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.5
+                if abs(basis.atom_position[i, 0] - 0.5) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.5
             else:
                 raise ValueError("Wyckoff Symbol for P 4 m m not recognised")
 # 100
@@ -746,28 +768,28 @@ def preferred_basis(space_group, basis_atom_position, basis_wyckoff):
                 pass  # no reassignment needed
             elif wyckoff_symbol == 'h':
                 # Change to [x,x,0]
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             elif wyckoff_symbol == 'i':
                 # Change equivalent coordinate [0,y,0]
-                if abs(basis_atom_position[i, 0]) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.0
+                if abs(basis.atom_position[i, 0]) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.0
             elif wyckoff_symbol == 'j':
                 # Change equivalent coordinate [1/2,y,0]
-                if abs(basis_atom_position[i, 0] - 0.5) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.5
+                if abs(basis.atom_position[i, 0] - 0.5) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.5
             elif wyckoff_symbol == 'k':
                 # Change to [x,1/2+x,1/4]
-                basis_atom_position[i, 1] = basis_atom_position[i, 0] + 0.5
+                basis.atom_position[i, 1] = basis.atom_position[i, 0] + 0.5
             elif wyckoff_symbol == 'm':
                 # Change to [x,x,z]
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             elif wyckoff_symbol == 'n':
                 # Change equivalent coordinate [0,y,z]
-                if abs(basis_atom_position[i, 0]) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.0
+                if abs(basis.atom_position[i, 0]) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.0
             else:
                 raise ValueError("Wyckoff Symbol for I4/m m m not recognised")
 # 140
@@ -776,22 +798,22 @@ def preferred_basis(space_group, basis_atom_position, basis_wyckoff):
             if wyckoff_symbol in ['a', 'b', 'c', 'd', 'g']:
                 pass  # no reassignment needed
             elif wyckoff_symbol == 'e':
-                if abs(basis_atom_position[i, 2]) < 1e-10:
-                    if abs(basis_atom_position[i, 0] - 0.25) < 1e-10:
-                        basis_atom_position[i, 0] = 0.25 - basis_atom_position[i, 1]
-                        basis_atom_position[i, 1] = 0.0
-                        basis_atom_position[i, 2] = 0.25
-                    elif abs(basis_atom_position[i, 0] - 0.75) < 1e-10:
-                        basis_atom_position[i, 0] = basis_atom_position[i, 1] - 0.25
-                        basis_atom_position[i, 1] = 0.0
-                        basis_atom_position[i, 2] = 0.25
+                if abs(basis.atom_position[i, 2]) < 1e-10:
+                    if abs(basis.atom_position[i, 0] - 0.25) < 1e-10:
+                        basis.atom_position[i, 0] = 0.25 - basis.atom_position[i, 1]
+                        basis.atom_position[i, 1] = 0.0
+                        basis.atom_position[i, 2] = 0.25
+                    elif abs(basis.atom_position[i, 0] - 0.75) < 1e-10:
+                        basis.atom_position[i, 0] = basis.atom_position[i, 1] - 0.25
+                        basis.atom_position[i, 1] = 0.0
+                        basis.atom_position[i, 2] = 0.25
             elif wyckoff_symbol == 'f':
-                if abs(basis_atom_position[i, 2] - 0.375) < 1e-10:
-                    basis_atom_position[i, 1] = basis_atom_position[i, 0] + 0.25
-                    basis_atom_position[i, 2] = 0.125
-                elif abs(basis_atom_position[i, 2] - 0.625) < 1e-10:
-                    basis_atom_position[i, 1] = basis_atom_position[i, 0] + 0.25
-                    basis_atom_position[i, 2] = 0.125
+                if abs(basis.atom_position[i, 2] - 0.375) < 1e-10:
+                    basis.atom_position[i, 1] = basis.atom_position[i, 0] + 0.25
+                    basis.atom_position[i, 2] = 0.125
+                elif abs(basis.atom_position[i, 2] - 0.625) < 1e-10:
+                    basis.atom_position[i, 1] = basis.atom_position[i, 0] + 0.25
+                    basis.atom_position[i, 2] = 0.125
             else:
                 raise ValueError("Wyckoff Symbol for 142, I41/a c d not recognised")
 # 143
@@ -850,17 +872,17 @@ def preferred_basis(space_group, basis_atom_position, basis_wyckoff):
             if wyckoff_symbol in ['a', 'd', 'g']:
                 pass  # no reassignment needed
             elif wyckoff_symbol == 'b':
-                if abs(basis_atom_position[i, 0]) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.0
+                if abs(basis.atom_position[i, 0]) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.0
             elif wyckoff_symbol == 'c':
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             elif wyckoff_symbol == 'e':
-                if abs(basis_atom_position[i, 0] - 0.5) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.5
+                if abs(basis.atom_position[i, 0] - 0.5) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.5
             elif wyckoff_symbol == 'f':
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             else:
                 raise ValueError("Wyckoff Symbol for P6mm not recognised")
 # 192
@@ -870,29 +892,29 @@ def preferred_basis(space_group, basis_atom_position, basis_wyckoff):
                                   'f', 'g', 'h', 'm', 'r']:
                 pass  # no reassignment needed
             elif wyckoff_symbol == 'i':
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             elif wyckoff_symbol == 'j':
-                if abs(basis_atom_position[i, 0]) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.0
+                if abs(basis.atom_position[i, 0]) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.0
             elif wyckoff_symbol == 'k':
-                if abs(basis_atom_position[i, 0] - 0.5) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.5
+                if abs(basis.atom_position[i, 0] - 0.5) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.5
             elif wyckoff_symbol == 'l':
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             elif wyckoff_symbol == 'n':
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             elif wyckoff_symbol == 'o':
-                if abs(basis_atom_position[i, 0]) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.0
+                if abs(basis.atom_position[i, 0]) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.0
             elif wyckoff_symbol == 'p':
-                if abs(basis_atom_position[i, 0] - 0.5) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.5
+                if abs(basis.atom_position[i, 0] - 0.5) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.5
             elif wyckoff_symbol == 'q':
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             else:
                 raise ValueError("Wyckoff Symbol for P6/mmm not recognised")
 # 195
@@ -925,28 +947,28 @@ def preferred_basis(space_group, basis_atom_position, basis_wyckoff):
             if wyckoff_symbol in ['a', 'b', 'c', 'd', 'e', 'f', 'm']:
                 pass  # no reassignment needed
             elif wyckoff_symbol == 'g':
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
-                basis_atom_position[i, 2] = 0.0
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
+                basis.atom_position[i, 2] = 0.0
             elif wyckoff_symbol == 'h':
-                if abs(basis_atom_position[i, 0]) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.0
-                basis_atom_position[i, 2] = 0.0
+                if abs(basis.atom_position[i, 0]) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.0
+                basis.atom_position[i, 2] = 0.0
             elif wyckoff_symbol == 'i':
-                if abs(basis_atom_position[i, 0] - 0.5) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.5
-                basis_atom_position[i, 2] = 0.0
+                if abs(basis.atom_position[i, 0] - 0.5) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.5
+                basis.atom_position[i, 2] = 0.0
             elif wyckoff_symbol == 'j':
-                basis_atom_position[i, 1] = basis_atom_position[i, 0]
+                basis.atom_position[i, 1] = basis.atom_position[i, 0]
             elif wyckoff_symbol == 'k':
-                if abs(basis_atom_position[i, 0]) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.0
+                if abs(basis.atom_position[i, 0]) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.0
             elif wyckoff_symbol == 'l':
-                if abs(basis_atom_position[i, 0] - 0.5) < 1e-10:
-                    basis_atom_position[i, 0] = basis_atom_position[i, 1]
-                    basis_atom_position[i, 1] = 0.5
+                if abs(basis.atom_position[i, 0] - 0.5) < 1e-10:
+                    basis.atom_position[i, 0] = basis.atom_position[i, 1]
+                    basis.atom_position[i, 1] = 0.5
             else:
                 raise ValueError("Wyckoff Symbol for Pm-3m not recognised")
 # 222
@@ -966,50 +988,54 @@ def preferred_basis(space_group, basis_atom_position, basis_wyckoff):
         else:
             raise ValueError("Space group not implemented")
 
-        return basis_atom_position
+        return
 
 
-def hkl_make(ar_vec_m, br_vec_m, cr_vec_m, big_k, lattice_type,
-             min_reflection_pool, min_strong_beams, g_limit, input_hkls,
-             electron_wave_vector_magnitude):
+def hkl_make(xtal, hkl, bloch, rc):
+# def hkl_make(ar_vec_m, br_vec_m, cr_vec_m, big_k, lattice_type,
+#              min_reflection_pool, min_strong_beams, rc.g_limit, input_hkls,
+#              electron_wave_vector_magnitude):
     """
     Generates Miller indices that satisfy the selection rules for a given
     lattice type and are close to the Bragg condition.
 
     Parameters:
-    ar_vec_m (ndarray): Reciprocal lattice vector a
-    br_vec_m (ndarray): Reciprocal lattice vector b
-    cr_vec_m (ndarray): Reciprocal lattice vector c
-    lattice_type (str): Lattice type (from space group name)
-    min_strong_beams (int): Minimum number of strong beams required
-    g_limit (float): Upper limit for g-vector magnitude
-    electron_wave_vector_magnitude (float):
+    xtal.ar_vec_m (ndarray): Reciprocal lattice vector a
+    xtal.br_vec_m (ndarray): Reciprocal lattice vector b
+    xtal.cr_vec_m (ndarray): Reciprocal lattice vector c
+    xtal.lattice_type (str): Lattice type (from space group name)
+    rc.min_strong_beams (int): Minimum number of strong beams required
+    rc.g_limit (float): Upper limit for g-vector magnitude
+    bloch.big_k (ndarray): vector K along Z in microscope frame (=[001])
+    bloch.big_k_mag (float): magnitude of K
 
     Returns:
-    hkl (ndarray): Miller indices close to the Bragg condition
+    hkl_indices (ndarray): Miller indices close to the Bragg condition
     g_pool (ndarray): in the microscope reference frame
     g_magnitudes (ndarray): their magnitudes
     """
-
     # Calculate the magnitude of reciprocal lattice basis vectors
-    ar_mag = np.linalg.norm(ar_vec_m)
-    br_mag = np.linalg.norm(br_vec_m)
-    cr_mag = np.linalg.norm(cr_vec_m)
+    ar_mag = np.linalg.norm(xtal.ar_vec_m)
+    br_mag = np.linalg.norm(xtal.br_vec_m)
+    cr_mag = np.linalg.norm(xtal.cr_vec_m)
 
     # Determine shell size (smallest basis vector)
     shell = min(ar_mag, br_mag, cr_mag)
 
-    if g_limit < 1e-10:
+    # rc.g_limit is the (fixed) input limit of g-vector magnitude
+    # g_lim is the (variable) limit of g-vector magnitude to fill the pool
+    if rc.g_limit < 1e-10:
         # Use default value and set min_reflection_pool as cutoff
-        g_limit = 10.0 * 2 * np.pi
+        g_lim = 10.0 * 2 * np.pi
     else:
-        # Make min_reflection_pool large and use g_limit as the cutoff
-        min_reflection_pool = 6666
+        # Make min_reflection_pool large and use rc.g_limit as the cutoff
+        rc.min_reflection_pool = 6666
+        g_lim = rc.g_limit * 1.0
 
-    # Maximum indices to consider based on g_limit
-    max_h = int(np.ceil(g_limit / ar_mag))
-    max_k = int(np.ceil(g_limit / br_mag))
-    max_l = int(np.ceil(g_limit / cr_mag))
+    # Maximum indices to consider based on g_lim
+    max_h = int(np.ceil(g_lim / ar_mag))
+    max_k = int(np.ceil(g_lim / br_mag))
+    max_l = int(np.ceil(g_lim / cr_mag))
 
     # Generate grid of h, k, l values
     h_range = np.arange(-max_h, max_h + 1)
@@ -1019,30 +1045,30 @@ def hkl_make(ar_vec_m, br_vec_m, cr_vec_m, big_k, lattice_type,
     hkl_pool = np.stack((h_.ravel(), k_.ravel(), l_.ravel()), axis=-1)
 
     # Apply selection rules using a mask
-    if lattice_type == "F":
+    if xtal.lattice_type == "F":
         mask = (hkl_pool[:, 0] + hkl_pool[:, 1]) % 2 == 0
         mask &= (hkl_pool[:, 1] + hkl_pool[:, 2]) % 2 == 0
         mask &= (hkl_pool[:, 2] + hkl_pool[:, 0]) % 2 == 0
-    elif lattice_type == "I":
+    elif xtal.lattice_type == "I":
         mask = (hkl_pool.sum(axis=1) % 2) == 0
-    elif lattice_type == "A":
+    elif xtal.lattice_type == "A":
         mask = (hkl_pool[:, 1] + hkl_pool[:, 2]) % 2 == 0
-    elif lattice_type == "B":
+    elif xtal.lattice_type == "B":
         mask = (hkl_pool[:, 0] + hkl_pool[:, 2]) % 2 == 0
-    elif lattice_type == "C":
+    elif xtal.lattice_type == "C":
         mask = (hkl_pool[:, 0] + hkl_pool[:, 1]) % 2 == 0
-    elif lattice_type == "R":
+    elif xtal.lattice_type == "R":
         mask = (hkl_pool[:, 0] - hkl_pool[:, 1] + hkl_pool[:, 2]) % 3 == 0
-    elif lattice_type == "V":
+    elif xtal.lattice_type == "V":
         mask = (-hkl_pool[:, 0] + hkl_pool[:, 1] + hkl_pool[:, 2]) % 3 == 0
-    elif lattice_type == "P":
+    elif xtal.lattice_type == "P":
         mask = np.ones(len(hkl_pool), dtype=bool)
     else:
         raise ValueError("Space group not recognised")
     hkl_pool = hkl_pool[mask]
 
     # Calculate g-vectors and their magnitudes
-    g_pool = hkl_pool @ np.array([ar_vec_m, br_vec_m, cr_vec_m])
+    g_pool = hkl_pool @ np.array([xtal.ar_vec_m, xtal.br_vec_m, xtal.cr_vec_m])
     g_mag = np.linalg.norm(g_pool, axis=1) + 1.0e-12
     sorter = np.argsort(g_mag)
     g_pool = g_pool[sorter]
@@ -1050,51 +1076,53 @@ def hkl_make(ar_vec_m, br_vec_m, cr_vec_m, big_k, lattice_type,
     g_mag = np.linalg.norm(g_pool, axis=1) + 1.0e-12
 
     # Calculate deviation from Bragg condition
-    g_plus_k = g_pool + big_k
-    deviations = np.abs(electron_wave_vector_magnitude -
+    g_plus_k = g_pool + bloch.big_k
+    deviations = np.abs(bloch.big_k_mag -
                         np.linalg.norm(g_plus_k, axis=1)) / g_mag
     deviations[0] = 0  # 000 beam
-    
+
     # we choose reflections by increasing the radius of reciprocal space
     # explored until we have enough
-    # (limited by g_limit or min_reflection_pool, whichever is smallest)
+    # (limited by rc.g_limit or min_reflection_pool, whichever is smallest)
 
     # first shell
     lnd = 1.0  # Number of the shell
     current_g_limit = shell*lnd
     mask = (g_mag <= current_g_limit) & (deviations < 0.08)
-    hkl = hkl_pool[mask]
+    hkl_indices = hkl_pool[mask]
     # expand until we have enough
-    while (len(hkl) < min_reflection_pool) and (lnd * shell < g_limit):
+    while (len(hkl_indices) < rc.min_reflection_pool) and (lnd*shell < g_lim):
         lnd += 1.0
         current_g_limit = shell*lnd
         mask = (g_mag <= current_g_limit) & (deviations < 0.08)
-        hkl = hkl_pool[mask]
-    g_pool = g_pool[mask]
-    g_mag = g_mag[mask]
+        hkl_indices = hkl_pool[mask]
 
     # Check if enough beams are present
-    if len(hkl) < min_strong_beams:
+    if len(hkl_indices) < rc.min_strong_beams:
         raise ValueError("Beam pool is too small, please increase g_limit!")
 
     # Check if required output HKLs are in the hkl list
-    g_output = ([])
-    for g in input_hkls:
-        comparison = np.all(hkl == g, axis=1)
+    hkl_output = ([])
+    for g in hkl.input_hkls:
+        comparison = np.all(hkl_indices == g, axis=1)
         if not np.any(comparison):
             print(f"Input hkl not found: {g}")
         idx = np.where(comparison)
         if len(idx[0]) > 0:
-            g_output.append(idx[0][0])
-    g_output = np.append([0],np.array(g_output))
+            hkl_output.append(idx[0][0])
+    hkl_output = np.append([0], np.array(hkl_output))
 
-    return hkl, g_pool, g_mag, np.array(g_output)
+    bloch.g_pool = g_pool[mask]
+    bloch.g_pool_mag = g_mag[mask]
+    bloch.hkl_indices = hkl_indices
+    bloch.hkl_output = np.array(hkl_output)
+    bloch.n_hkl = len(bloch.g_pool)
+
+    # return hkl, g_pool, g_mag, np.array(hkl_output)
+    return
 
 
-def Fg_matrix(n_hkl, scatter_factor_method, basis_atom_label, atom_label,
-              atom_coordinate, atomic_number, occupancy, u_ij, g_matrix,
-              absorption_method, absorption_per, electron_velocity, kappas, pv,
-              Debye, model, debug):
+def Fg_matrix(xtal, basis, cell, bloch, rc):
     """
     Parameters
     ----------
@@ -1105,15 +1133,14 @@ def Fg_matrix(n_hkl, scatter_factor_method, basis_atom_label, atom_label,
     atom_coordinate : float, fractional atom coordinates, size [n_cell, 3]
     atomic_number : int, size [n_cell], number of atoms in the cell
     occupancy : float, size [n_cell]
-    u_ij : float array of ADPs, size [n_cell,3,3]
+    u_aniso : float array of ADPs, size [n_cell,3,3]
     g_matrix : array of g-vectors in the microscope frame, size [n_hkl,n_hkl]
     absorption_method : int, flag for absorption calculation
     absorption_per : float, % absorption, if that method is used
     electron_velocity : float
     kappas : TYPE DESCRIPTION.
     pv : TYPE DESCRIPTION.
-    Debye : TYPE DESCRIPTION.
-    model : TYPE DESCRIPTION.
+    r2 : TYPE DESCRIPTION.
 
     Raises
     ------
@@ -1121,141 +1148,178 @@ def Fg_matrix(n_hkl, scatter_factor_method, basis_atom_label, atom_label,
 
     Returns
     -------
-    Fg_matrix : size [n_hkl,n_hkl]
+    bloch.g_matrix : size [n_hkl,n_hkl]
+    bloch.g_dot_norm : size [n_hkl,n_hkl]
     """
-    n_basis = len(basis_atom_label)
-    n_cell = len(atom_label)
-    # calculate g.r for all g-vectors and atom posns [n_hkl, n_hkl, n_cell]
-    g_dot_r = np.einsum('ijk,lk->ijl', g_matrix, atom_coordinate)
-    # exp(i g.r) [n_hkl, n_hkl, n_cell]
+    # initialise g-vector matrix, array [n_hkl, n_hkl, 3]
+    bloch.g_matrix = np.zeros((bloch.n_hkl, bloch.n_hkl, 3))
+    # fill it with g-vectors
+    bloch.g_matrix = bloch.g_pool[:, np.newaxis, :] \
+        - bloch.g_pool[np.newaxis, :, :]
+    # calculate g.r for all g-vectors and atoms [n_hkl, n_hkl, cell.n_atoms]
+    g_dot_r = np.einsum('ijk,lk->ijl', bloch.g_matrix, cell.atom_coordinate)
+    # exp(i g.r) [n_hkl, n_hkl, cell.n_atoms]
     phase = np.exp(-1j * g_dot_r)
 
-    # NB scattering factor methods accept and return 2D[n_hkl, n_hkl] array of
+    # NB scattering factor methods accept and return
+    # up to 2D[n_hkl, n_hkl] array of
     # g magnitudes but only one atom type.
+    # NB it's much more efficient to calculate
+    # scattering factors for unique g magnitudes and map
+    # them back onto the g_matrix
 
     # g-vector magnitudes, size [n_hkl, n_hkl]
-    g_magnitude = np.sqrt(np.sum(g_matrix**2, axis=2))
+    g_magnitude = np.sqrt(np.sum(bloch.g_matrix**2, axis=2))
+    tol = 1e-6  # tolerance for considering g's equal
+    g_magnitude = np.round(g_magnitude / tol) * tol
+    # get unique g's and + mapping back
+    bloch.uniq_gmag, inverse = np.unique(g_magnitude, return_inverse=True)
 
-    # anisotropic DP U*g[i]*g[j], size [n_cell, n_hkl, n_hkl]
-    Ugg = np.einsum('ijm, a mn, ij n -> aij', g_matrix, u_ij, g_matrix)
-    # equivalent anisotropic B, size [n_cell, n_hkl, n_hkl]
-    B_aniso = np.divide(Ugg, np.square(g_magnitude), out=np.zeros_like(Ugg),
+    # anisotropic ADP U*g[i]*g[j], size [cell.n_atoms, n_hkl, n_hkl]
+    Ugg = np.einsum('ijm, a mn, ij n -> aij', bloch.g_matrix,
+                    cell.u_aniso, bloch.g_matrix)
+    # equivalent anisotropic B, size [cell.n_atoms, n_hkl, n_hkl]
+    B_aniso = np.divide(Ugg, np.square(g_magnitude),
+                        out=np.zeros_like(Ugg),
                         where=(g_magnitude != 0)) * 8 * np.pi**2
-    if debug:
+    if rc.debug:
         np.set_printoptions(precision=3, suppress=True)
         print("g_magnitudes")
         print(g_magnitude[:5, :5])
         print("  ")
-        for i in range(3):
-            print(f"Anisotropic u_ij*g[i]*g[j] [{i}]")
+        for i in range(basis.n_atoms):
+            print(f"Anisotropic u_aniso*g[i]*g[j] [{i}]")
             print(f"{Ugg[i, :5, :5]}")
         print("  ")
-        for i in range(3):
+        for i in range(basis.n_atoms):
             print(f"Anisotropic B[{i}]")
             print(f"{B_aniso[i, :5, :5]}")
         print("  ")
 
     # scattering factors, atom by atom in the basis and applied to cell
-    f_gb = np.zeros([n_basis, n_hkl, n_hkl], dtype=np.complex128)
-    f_gb_prime = np.zeros([n_basis, n_hkl, n_hkl], dtype=np.complex128)
-    f_g = np.zeros([n_cell, n_hkl, n_hkl], dtype=np.complex128)
-    f_g_prime = np.zeros([n_cell, n_hkl, n_hkl], dtype=np.complex128)
-    for i in range(n_basis):
-        # get the scattering factor for the basis f_gb
-        if scatter_factor_method == 0:
-            f_gb[i, :, :] = f_kirkland(atomic_number[i], g_magnitude)
-        elif scatter_factor_method == 1:
-            f_gb[i, :, :] = f_lobato(atomic_number[i], g_magnitude)
-        elif scatter_factor_method == 2:
-            f_gb[i, :, :] = f_peng(atomic_number[i], g_magnitude)
-        elif scatter_factor_method == 3:
-            f_gb[i, :, :] = f_doyle_turner(atomic_number[i], g_magnitude)
-        elif scatter_factor_method == 4:
-            print("Calculating kappa factor for atom", i+1, "/", n_cell)
-            f_gb[i, :, :] = kappa_factors(g_magnitude, atomic_number[i],
-                                          pv[i], kappas[i])
+    basis.f_g = np.zeros([basis.n_atoms, bloch.n_hkl, bloch.n_hkl],
+                         dtype=np.complex128)
+    basis.f_g_prime = np.zeros([basis.n_atoms, bloch.n_hkl, bloch.n_hkl],
+                               dtype=np.complex128)
+    cell.f_g = np.zeros([cell.n_atoms, bloch.n_hkl, bloch.n_hkl],
+                        dtype=np.complex128)
+    cell.f_g_prime = np.zeros([cell.n_atoms, bloch.n_hkl, bloch.n_hkl],
+                              dtype=np.complex128)
+    for i in range(basis.n_atoms):
+        # get the scattering factor for the basis basis.f_g
+        if rc.scatter_factor_method == 0:
+            uniq_q = f_kirkland(basis.atomic_number[i],
+                                bloch.uniq_gmag).ravel()
+        elif rc.scatter_factor_method == 1:
+            uniq_q = f_lobato(basis.atomic_number[i],
+                              bloch.uniq_gmag).ravel()
+        elif rc.scatter_factor_method == 2:
+            uniq_q = f_peng(basis.atomic_number[i],
+                            bloch.uniq_gmag).ravel()
+        elif rc.scatter_factor_method == 3:
+            uniq_q = f_doyle_turner(basis.atomic_number[i],
+                                    bloch.uniq_gmag).ravel()
+        elif rc.scatter_factor_method == 4:
+            print(f"Calculating kappa factor for atom {i+1}/{basis.n_atoms}")
+            uniq_q = f_kappa(xtal, basis, bloch.uniq_gmag, i)
         else:
             raise ValueError("No scattering factors chosen in felix.inp")
 
-        # get the absorptive scattering factor for the basis f_gb_prime
-        if absorption_method == 0:  # no absorption
-            f_gb_prime[i, :, :] = np.zeros_like(f_g)
-        elif absorption_method == 1:  # proportional model
-            f_gb_prime[i, :, :] = 1j * f_g * absorption_per/100.0
-        elif absorption_method == 2:  # Bird & King, Thomas (Acta Cryst 2023)
-            f_gb_prime[i, :, :] = 1j * f_thomas(g_magnitude, B_aniso[i, :, :],
-                                      atomic_number[i], electron_velocity)
-        if debug:
-            print(f"f_g [{i}]")
-            print(f"{f_g[i, :5, :5]}")
-            print("  ")
-            print(f"f_g_prime [{i}]")
-            print(f"{f_g_prime[i, :5, :5]}")
+        # map back into basis.f_g
+        basis.f_g[i, :, :] = (uniq_q[inverse].reshape(g_magnitude.shape))
 
+        # get the absorptive scattering factor for the basis basis.f_g_prime
+        if rc.absorption_method == 0:  # no absorption
+            basis.f_g_prime[i, :, :] = np.zeros_like(basis.f_g)
+        elif rc.absorption_method == 1:  # proportional model
+            basis.f_g_prime[i, :, :] = 0.01j * basis.f_g * rc.absorption_per
+        elif rc.absorption_method == 2:  # Bird & King, Thomas
+            basis.f_g_prime[i, :, :] = 1j * f_thomas(g_magnitude,
+                                                     B_aniso[i, :, :],
+                                                     basis.atomic_number[i],
+                                                     bloch.electron_velocity)
+        if rc.debug:
+            print(f"basis.f_g [{i}]")
+            print(f"{basis.f_g[i, :5, :5]}")
+            print("  ")
+            print(f"basis.f_g_prime [{i}]")
+            print(f"{basis.f_g_prime[i, :5, :5]}")
+
+        # combine f and f'
+        basis.f_g[i, :, :] += basis.f_g_prime[i, :, :]
         # put into the unit cell
-        for j in range(n_cell):
-            if atom_label[j] == basis_atom_label[i]:
-                f_g[j, :, :] = f_gb[i, :, :]
+        for j in range(cell.n_atoms):
+            if cell.atom_label[j] == basis.atom_label[i]:
+                cell.f_g[j, :, :] = basis.f_g[i, :, :]
 
     # now make up the full matrix
-    Fg_matrix = np.zeros([n_hkl, n_hkl], dtype=np.complex128)
-    for i in range(n_cell):
+    Fg_matrix = np.zeros([bloch.n_hkl, bloch.n_hkl], dtype=np.complex128)
+    for i in range(cell.n_atoms):
         # The Structure Factor Equation
-        Fg_matrix = Fg_matrix+((f_g[i, :, :] + f_g_prime[i, :, :]) * phase[:, :, i] *
-                               occupancy[i] *
+        Fg_matrix = Fg_matrix+(cell.f_g[i, :, :]
+                               * phase[:, :, i]
+                               * cell.occupancy[i]
                                # np.exp(-B_aniso[i, :, :] * (g_magnitude**2) /
                                # (16*np.pi**2)))
-                               np.exp(-Ugg[i, :, :] / 2))
+                               * np.exp(-Ugg[i, :, :] / 2))
+    # Conversion factor from F_g to U_g
+    Fg_to_Ug = bloch.relativistic_correction / (np.pi * xtal.cell_volume)
+    bloch.ug_matrix = Fg_to_Ug * Fg_matrix
+    # matrix of dot products with the surface normal
+    bloch.g_dot_norm = np.dot(bloch.g_pool, xtal.norm_dir_m)
 
-    return Fg_matrix
+    return
 
 
-def deviation_parameter(convergence_angle, image_radius, big_k_mag, g_pool,
-                        g_pool_mag):
+def deviation_parameter(bloch, rc):
+# def deviation_parameter(convergence_angle, image_radius, big_k_mag, g_pool,
+#                         g_pool_mag):
     # for LACBED pattern of size [m, m] and a set of g-vectors [n, 3]
     # this returns a 3D array of deviation parameters [m, m, n]
 
     # resolution in k-space
-    delta_K = 2.0*np.pi * convergence_angle/image_radius
+    delta_K = 2.0*np.pi * rc.convergence_angle/rc.image_radius
 
     # pixel grids
-    x_pix = np.arange(-image_radius+.5, image_radius+.5)
-    y_pix = np.arange(-image_radius+.5, image_radius+.5)
+    x_pix = np.arange(-rc.image_radius+.5, rc.image_radius+.5)
+    y_pix = np.arange(-rc.image_radius+.5, rc.image_radius+.5)
     # k_x and k_y
     k_x, k_y = np.meshgrid(x_pix * delta_K, y_pix * delta_K)
 
     # k-vector for all pixels k'
-    k_z = np.sqrt(big_k_mag**2 - k_x**2 - k_y**2)
-    tilted_k = np.stack([k_x, k_y, k_z], axis=-1)
+    k_z = np.sqrt(bloch.big_k_mag**2 - k_x**2 - k_y**2)
+    bloch.tilted_k = np.stack([k_x, k_y, k_z], axis=-1)
 
     # g excuding g_pool[0], which is always [000]
-    g_pool1 = g_pool[1:]  # shape: (n_hkl-1, 3)
-    g_pool_mag1 = g_pool_mag[1:]  # shape: (n_hkl-1)
+    g_pool1 = bloch.g_pool[1:]  # shape: (n_hkl-1, 3)
+    g_pool_mag1 = bloch.g_pool_mag[1:]  # shape: (n_hkl-1)
     # Components of k_0
     k_0_0 = -g_pool_mag1 / 2
-    k_0_2 = np.sqrt(big_k_mag**2 - k_0_0**2)
+    k_0_2 = np.sqrt(bloch.big_k_mag**2 - k_0_0**2)
     # Components of k_prime
-    k_prime_0 = np.einsum('ijk,lk->ijl', tilted_k, g_pool1) / g_pool_mag1
-    k_prime_2 = np.sqrt(big_k_mag**2 - k_prime_0**2)
+    k_prime_0 = np.einsum('ijk,lk->ijl', bloch.tilted_k, g_pool1) / g_pool_mag1
+    k_prime_2 = np.sqrt(bloch.big_k_mag**2 - k_prime_0**2)
 
     k_0_dot_k_prime = (k_0_0[None, None, :] * k_prime_0 +
                        k_0_2[None, None, :] * k_prime_2)
     pm = -np.sign(2*k_prime_0 + g_pool_mag1)
-    s_g = pm * np.sqrt(2*abs(big_k_mag**2 - k_0_dot_k_prime)) * \
-        (g_pool_mag1/big_k_mag)
+    s_g = pm * np.sqrt(2*abs(bloch.big_k_mag**2 - k_0_dot_k_prime)) * \
+        (g_pool_mag1/bloch.big_k_mag)
 
     # add in 000
     s_0 = np.expand_dims(np.zeros_like(k_x), axis=-1)
-    s_g = np.concatenate([s_0, s_g], axis=-1)  # add 000
+    bloch.s_g = np.concatenate([s_0, s_g], axis=-1)  # add 000
 
-    return s_g, tilted_k
+    # return s_g, tilted_k
+    return
 
 
-def strong_beams(s_g_pix, ug_matrix, min_strong_beams):
+def strong_beams(bloch, rc):
+    # def strong_beams(s_g_pix, ug_matrix, min_strong_beams):
     """
     returns a list of strong beams according to their perturbation strength
-    NB s_g_pix here is a 1D array of values for a given pixel, and is different
-    to the s_g in the main code which is for all pixels & g-vectors
+    NB bloch.s_g_pix here is a 1D array of values for a given pixel,
+    and is different to bloch.s_g which is for all pixels & g-vectors
 
     Perturbation Strength Eq. 8 Zuo Ultramicroscopy 57 (1995) 375, |Ug/2KSg|
     Here use |Ug/Sg| since 2K is a constant
@@ -1263,51 +1327,59 @@ def strong_beams(s_g_pix, ug_matrix, min_strong_beams):
     """
 
     # Perturbation strength |Ug/Sg|, put 100 where we have s_g=0
-    u_g = np.abs(ug_matrix[:, 0])
-    pert = np.divide(u_g, np.abs(s_g_pix),
-                     out=np.full_like(s_g_pix, 100.0), where=s_g_pix != 0)
+    u_g = np.abs(bloch.ug_matrix[:, 0])
+    pert = np.divide(u_g, np.abs(bloch.s_g_pix),
+                     out=np.full_like(bloch.s_g_pix, 100.0),
+                     where=bloch.s_g_pix != 0)
     # deviation parameter and perturbation thresholds for strong beams
     max_sg = 0.001
 
     # Determine strong beams: Increase max_sg until enough beams are found
-    strong = np.zeros_like(s_g_pix, dtype=int)
-    while np.sum(strong) < min_strong_beams:
+    strong = np.zeros_like(bloch.s_g_pix, dtype=int)
+    while np.sum(strong) < rc.min_strong_beams:
         min_pert_strong = 0.025 / max_sg
-        strong = np.where((np.abs(s_g_pix) < max_sg)
+        strong = np.where((np.abs(bloch.s_g_pix) < max_sg)
                           | (pert >= min_pert_strong), 1, 0)
         max_sg += 0.001
 
     # Create strong beam list
-    return np.flatnonzero(strong)
+    bloch.strong_beam = np.flatnonzero(strong)
+    # return np.flatnonzero(strong)
+    return
 
 
-def bloch(g_output, s_g_pix, ug_matrix, min_strong_beams, n_hkl,
-          big_k_mag, g_dot_norm, k_dot_n_pix, debug):
+def blochwave(bloch, rc):
+# def blochwave(g_output, s_g_pix, ug_matrix, min_strong_beams, n_hkl,
+#           big_k_mag, g_dot_norm, k_dot_n_pix, debug):
 
     # strong_beam_indices gives the index of a strong beam in the beam pool
     # Use Sg and perturbation strength to define strong beams
-    strong_beam = strong_beams(s_g_pix, ug_matrix, min_strong_beams)
+    # strong_beam = strong_beams(s_g_pix, ug_matrix, min_strong_beams)
+    strong_beams(bloch, rc)
+    # print(f"spoink {bloch.strong_beam}")
     # which ones are new (i.e. not already in the output list)
-    strong_new = np.setdiff1d(strong_beam, g_output)
+    strong_new = np.setdiff1d(bloch.strong_beam, bloch.hkl_output)
     # make the structure matrix for this pixel, outputs top of the list
-    strong_beam_indices = np.concatenate((g_output, strong_new))
-    n_beams = len(strong_beam_indices)
+    bloch.strong_beam_indices = np.concatenate((bloch.hkl_output, strong_new))
+    bloch.n_beams = len(bloch.strong_beam_indices)
 
     # Make a Ug matrix for this pixel by selecting only strong beams
-    beam_projection_matrix = np.zeros((n_beams, n_hkl), dtype=np.complex128)
-    beam_projection_matrix[np.arange(n_beams), strong_beam_indices] = 1+0j
+    beam_projection_matrix = np.zeros((bloch.n_beams, bloch.n_hkl),
+                                      dtype=np.complex128)
+    beam_projection_matrix[np.arange(bloch.n_beams),
+                           bloch.strong_beam_indices] = 1+0j
     # reduce the matrix using some nifty matrix multiplication
     beam_transpose = beam_projection_matrix.T
-    ug_matrix_partial = np.dot(ug_matrix, beam_transpose)
+    ug_matrix_partial = np.dot(bloch.ug_matrix, beam_transpose)
     ug_sg_matrix = np.dot(beam_projection_matrix, ug_matrix_partial)
 
     # Final normalization of the matrix
     # off-diagonal elements are Ug/2K, diagonal elements are Sg
     # Spence's (1990) 'Structure matrix'
-    ug_sg_matrix = 2.0*np.pi**2 * ug_sg_matrix / big_k_mag
+    ug_sg_matrix = 2.0*np.pi**2 * ug_sg_matrix / bloch.big_k_mag
     # replace the diagonal with strong beam deviation parameters
-    ug_sg_matrix[np.arange(n_beams), np.arange(n_beams)] = \
-        s_g_pix[strong_beam_indices]
+    ug_sg_matrix[np.arange(bloch.n_beams), np.arange(bloch.n_beams)] = \
+        bloch.s_g_pix[bloch.strong_beam_indices]
 
     # weak beam correction (NOT WORKING)
     # px.weak_beams(s_g_pix, ug_matrix, ug_sg_matrix, strong_beam_indices,
@@ -1315,73 +1387,67 @@ def bloch(g_output, s_g_pix, ug_matrix, min_strong_beams, n_hkl,
 
     # surface normal correction part 1
     structure_matrix = np.zeros_like(ug_sg_matrix)
-    norm_factor = np.sqrt(1 + g_dot_norm[strong_beam_indices]/k_dot_n_pix)
+    norm_factor = np.sqrt(1 + bloch.g_dot_norm[bloch.strong_beam_indices] /
+                          bloch.k_dot_n_pix)
     structure_matrix = ug_sg_matrix / np.outer(norm_factor, norm_factor)
 
     # get eigenvalues (gamma), eigenvecs
-    gamma, eigenvecs = eig(structure_matrix)
+    bloch.gamma, bloch.eigenvecs = eig(structure_matrix)
     # Invert using LU decomposition (similar to ZGETRI in Fortran)
-    inv_eigenvecs = inv(eigenvecs)
+    # bloch.inv_eigenvecs = inv(eigenvecs)
+    # inv_eigenvecs = eigenvecs  # *** placeholder while testing
 
     # if debug:
     #     np.set_printoptions(precision=3, suppress=True)
     #     print("eigenvectors")
     #     print(eigenvecs[:5, :5])
 
-    return n_beams, strong_beam_indices, gamma, eigenvecs, inv_eigenvecs
+    # return n_beams, strong_beam_indices, gamma, eigenvecs, inv_eigenvecs
+    return
 
 
-def wave_functions(g_output, s_g_pix, ug_matrix, min_strong_beams,
-                   n_hkl, big_k_mag, g_dot_norm,
-                   k_dot_n_pix, thickness, debug):
+def wave_functions(bloch, rc):
+    # def wave_functions(g_output, s_g_pix, ug_matrix, min_strong_beams,
+    #                    n_hkl, big_k_mag, g_dot_norm,
+    #                    k_dot_n_pix, thickness, debug):
     # calculates wave functions for a given thickness by calling the bloch
     # subroutine to get the eigenvector matrices
     # and evaluating for a range of thicknesses
 
-    n_beams, strong_beam_indices, gamma, eigenvecs, inv_eigenvecs = bloch(
-        g_output, s_g_pix, ug_matrix, min_strong_beams, n_hkl, big_k_mag,
-        g_dot_norm, k_dot_n_pix, debug)
+    # n_beams,strong_beam_indices, gamma, eigenvecs, inv_eigenvecs = blochwave(
+    #     g_output, s_g_pix, ug_matrix, min_strong_beams, n_hkl, big_k_mag,
+    #     g_dot_norm, k_dot_n_pix, debug)
+    blochwave(bloch, rc)
     # calculate intensities
 
     # Initialize incident (complex) wave function psi0
     # all zeros except 000 beam which is 1
-    psi0 = np.zeros(n_beams, dtype=np.complex128)
+    psi0 = np.zeros(bloch.n_beams, dtype=np.complex128)
     psi0[0] = 1.0 + 0j
 
-    # surface normal correction part 2
-    m_ii = np.sqrt(1 + g_dot_norm[strong_beam_indices] / k_dot_n_pix)
-    inverted_m = np.diag(m_ii)
-    m_matrix = np.diag(1/m_ii)
+    # calculate wave function including surface normal correction
+    # M @ eigenvecs @ gamma @ eigenvecs^-1 @ M^-1 @ psi0
+    # M is a diagonal matrix made from vector of (1+g.n/k.n)**0.5
+    inv_m_ii = np.sqrt(1 + bloch.g_dot_norm[bloch.strong_beam_indices]
+                       / bloch.k_dot_n_pix)
+    m_ii = 1.0/inv_m_ii
+    # but we don't need to make the matrix as M^-1 @ psi0 can be
+    # calculated as a vector multiplication
+    u = inv_m_ii * psi0
+    # we can also avoid eigenvecs @ gamma @ eigenvecs^-1
+    # by solving for the eigenvectors
+    y = solve(bloch.eigenvecs, u)
 
-    # evaluate for the range of thicknesses
-    wave_function = ([])
-    if thickness.ndim == 0:  # just one thickness
-        gamma_t = np.diag(np.exp(1j * thickness * gamma))
-        wave_function.append(m_matrix @ eigenvecs @ gamma_t
-                             @ inv_eigenvecs @ inverted_m @ psi0)
-    else:  # multiple thicknesses
-        for t in thickness:
-            gamma_t = np.diag(np.exp(1j * t * gamma))
-            # calculate wave functions
-            wave_function.append(m_matrix @ eigenvecs @ gamma_t
-                                 @ inv_eigenvecs @ inverted_m @ psi0)
-
-    # ... or, for all thicknesses at once! not working, boo
-    # would avoid the type change when making wave_functions a numpy array
-    # thickness = thickness[:, np.newaxis]
-    # gamma_t = np.array([np.diag(np.exp(1j * t * gamma))
-    #                          for t in thickness.flatten()])
-    # wave_functions = np.einsum(
-    #     'ij,jk,tkm,mn,nl,l->ti',
-    #     m_matrix,
-    #     eigenvecs,
-    #     gamma_t,
-    #     inv_eigenvecs,
-    #     inverted_m,
-    #     psi0
-    # )
-
-    return np.array(wave_function)
+    # phase factors for all thicknesses
+    phase = np.exp(1j * np.outer(bloch.gamma, rc.thickness))
+    # apply phase to all thicknesses
+    y_t = y[:, None] * phase
+    z = bloch.eigenvecs @ y_t
+    wave_funct = m_ii[:, None] * z
+    bloch.wave_function = np.array(wave_funct.T)
+    # we expect an output shape [n_thickness, n_beams] so need to transpose
+    # return np.array(wave_function.T)
+    return
 
 
 def weak_beams(s_g_pix, ug_matrix, ug_sg_matrix, strong_beam_list,
@@ -1391,7 +1457,7 @@ def weak_beams(s_g_pix, ug_matrix, ug_sg_matrix, strong_beam_list,
     strength. We start with all non-strong beams in the list.
     We then raise the threshold perturbation strength until we have fewer than
     min_weak_beams in the list.  These are the strongest beams not included
-    in strong_beam_list.
+    in strong_beam_list
     """
 
     # Perturbation strength |Ug/Sg|, put 100 where we have s_g=0
@@ -1434,39 +1500,17 @@ def weak_beams(s_g_pix, ug_matrix, ug_sg_matrix, strong_beam_list,
     ug_sg_matrix[1:n_beams, 0] -= sum_c  # Update first column (sumC)
     ug_sg_matrix[1:n_beams, 1:n_beams] -= (2.0 * big_k_mag *
                                            sum_d[:, None]) / (4.0 * np.pi**2)
-    # old version using loops
-    # for j in range(1, n_beams):
-    #     sum_c = 0 + 0j  # Complex zero
-    #     sum_d = 0 + 0j  # Complex zero
 
-    #     for i in range(n_weak_beams):
-    #         # Eq. 4 from Zuo & Weickenmeier (Ultramicroscopy 57, 1995)
-    #         sum_c += (ug_matrix[strong_beam_list[j], weak[i]] *
-    #                   ug_matrix[weak[i], 0] /
-    #                   (2.0 * big_k_mag * s_g_pix[weak_beam_list[i]]))
-
-    #         # Eq. 5 from Zuo & Weickenmeier (Ultramicroscopy 57, 1995)
-    #         sum_d += (ug_matrix[strong_beam_list[j], weak_beam_list[i]] *
-    #                   ug_matrix[weak_beam_list[i], strong_beam_list[j]] /
-    #                   (2.0 * big_k_mag * s_g_pix[weak[i]]))
-
-    #     # Update the first column of the ug_sg_matrix
-    #     mask = ug_sg_matrix == ug_sg_matrix[j, 0]
-    #     ug_sg_matrix[mask] = ug_sg_matrix[j, 0] - sum_c
-
-    #     # Update the diagonal elements (Sg's)
-    #     ug_sg_matrix[j, j] = ug_sg_matrix[j, j] - \
-    #         2.0*big_k_mag*sum_d/(4.0*np.pi**2)
     return
 
 
-def f_kirkland(z, g_magnitude):
+def f_kirkland(z, g_pool_mag):
     """
     calculates atomic scattering factor using the Kirkland model.
     From Appendix C of "Advanced Computing in Electron Microscopy", 2nd ed.
 
     Parameters:
-    g_magnitude (ndarray): Magnitude of the scattering vector in 1/Å.
+    bloch.g_pool_mag (ndarray): Magnitude of the scattering vector in 1/Å.
     (NB exp(-i*g.r), physics negative convention)
     z (int): Atomic number, used to index scattering factors.
     kirkland (np.ndarray): Array of scattering factors from pylix_dicts
@@ -1474,26 +1518,23 @@ def f_kirkland(z, g_magnitude):
     Returns:
     ndarray: The calculated Kirkland scattering factor.
     """
-    
-    q = g_magnitude / (2*np.pi)
+    q = g_pool_mag / (2*np.pi)
     # coefficients in shape (3, 1, 1) for broadcasting
     a = fu.kirkland[z-1, 0:6:2].reshape(-1, 1, 1)
     b = fu.kirkland[z-1, 1:7:2].reshape(-1, 1, 1)
     c = fu.kirkland[z-1, 6:11:2].reshape(-1, 1, 1)
     d = fu.kirkland[z-1, 7:12:2].reshape(-1, 1, 1)
-   
-    f_g =   np.sum(a/(q**2+b), axis=0) + np.sum(c*np.exp(-(d*q**2)), axis=0)
+
+    f_g = np.sum(a/(q**2+b), axis=0) + np.sum(c*np.exp(-(d*q**2)), axis=0)
     return f_g
 
-# calc scattering factors for core density and valence density seperately
 
-
-def f_doyle_turner(z, g_magnitude):
+def f_doyle_turner(z, g_pool_mag):
     """
     calculates atomic scattering factor using the Doyle & Turner model.
 
     Parameters:
-    g_magnitude (ndarray): Magnitude of the scattering vector in 1/Å.
+    bloch.g_pool_mag (ndarray): Magnitude of the scattering vector in 1/Å.
     (NB exp(-i*g.r), physics negative convention)
     z (int): Atomic number, used to index scattering factors.
     kirkland (np.ndarray): Array of scattering factors from pylix_dicts
@@ -1502,7 +1543,7 @@ def f_doyle_turner(z, g_magnitude):
     ndarray: The calculated Doyle & Turner scattering factor.
     """
     # Convert g to s
-    s = g_magnitude / (2*np.pi)
+    s = g_pool_mag / (4*np.pi)
 
     a = fu.doyle_turner[z-1, 0:8:2].reshape(-1, 1, 1)
     b = fu.doyle_turner[z-1, 1:8:2].reshape(-1, 1, 1)
@@ -1512,12 +1553,12 @@ def f_doyle_turner(z, g_magnitude):
     return f_g
 
 
-def f_lobato(z, g_magnitude):
+def f_lobato(z, g_pool_mag):
     """
     calculates atomic scattering factor using the Lobato model.
     Lobato & van Dyck Acta Cryst A70, 636 (2014)
     Parameters:
-    g_magnitude (ndarray): Magnitude of the scattering vector in 1/Å.
+    bloch.g_pool_mag (ndarray): Magnitude of the scattering vector in 1/Å.
     (NB exp(-i*g.r), physics negative convention)
     z (int): Atomic number, used to index scattering factors.
     lobato (np.ndarray): Array of scattering factors from pylix_dicts
@@ -1526,7 +1567,7 @@ def f_lobato(z, g_magnitude):
     ndarray: The calculated Lobato scattering factor.
     """
     # Convert physics to crystallography convention
-    g = g_magnitude / (2*np.pi)
+    g = g_pool_mag / (2*np.pi)
 
     a = fu.lobato[z-1, 0:5].reshape(-1, 1, 1)
     b = fu.lobato[z-1, 5:10].reshape(-1, 1, 1)
@@ -1536,12 +1577,12 @@ def f_lobato(z, g_magnitude):
     return f_g
 
 
-def f_peng(z, g_magnitude):
+def f_peng(z, g_pool_mag):
     """
     calculates atomic scattering factor using the Peng model.
     Peng, Micron 30, 625 (1999)
     Parameters:
-    g_magnitude (ndarray): Magnitude of the scattering vector in 1/Å.
+    g_pool_mag (ndarray): Magnitude of the scattering vector in 1/Å.
     (NB exp(-i*g.r), physics negative convention)
     z (int): Atomic number, used to index scattering factors.
     peng (np.ndarray): Array of scattering factors from pylix_dicts
@@ -1550,7 +1591,7 @@ def f_peng(z, g_magnitude):
     ndarray: The calculated Peng scattering factor.
     """
     # Convert g to s
-    s = g_magnitude / (4*np.pi)
+    s = g_pool_mag / (4*np.pi)
 
     a = fu.peng[z-1, 0:4].reshape(-1, 1, 1)
     b = fu.peng[z-1, 4:8].reshape(-1, 1, 1)
@@ -1560,221 +1601,248 @@ def f_peng(z, g_magnitude):
     return f_g
 
 
-def calc_slater_orbitals(z, orbital, r):
-    # ok so now when we calc slater orbital we pass kappa scaled q
-    # r, distance of electron from atomic nucleus#
-    # N is normalizing constant
+def electron_configuration(Z):
+    # electron occupation of orbitals for element number Z
+    occ = {}
+    remaining = Z
+    for orb in fu.orbital_order:
+        if remaining <= 0:
+            break
+        cap = fu.orbital_capacity[orb[-1]]
+        n = min(cap, remaining)
+        occ[orb] = n
+        remaining -= n
 
-    delta = np.array(fu.slater_coefficients[z][orbital]['delta'])
-    delta = delta / 0.52917721092
-    # convert to angstrom
-    C = np.array(fu.slater_coefficients[z][orbital]['coeff'])
-    n = int(orbital[0])
-
-    # for now we just state 1s contriutes to the core and 2s contributes
-    # to valence with a respective electron occupation of 2,1
-    # we need array of R values to sample the electron density from
-    # so we can actually evaluate a fourier transform integral
-    R_total = 0
-
-    # Total radial finction is a superposition of these primitive radial
-    # functions and their corresponding expansion coefficent C_jln given
-    # in out hartree fock equation
-    # delta is given next to each slater type orbital in the table
-
-    # after we fourier transform radial function to get form factor we
-    # use Mott-Bethe formula to get to electron scattering factor
-    # then compare with kirkland to check agreement and upscale
-
-    for cj, zj in zip(C, delta):
-        Nj = ((2*zj)**(n+0.5))/(np.sqrt(math.factorial(2*n)))
-        # each electron is defined by a primitive slater orbital of this form
-        S_j = Nj*r**(n-1)*np.exp(-zj*r)
-        R_total += cj*S_j
-    # return the radial function for our atom, integrated to get form factor
-    return R_total
+    return occ
 
 
-"""
-def xray_form_factor_valence(r, rho, S,pv,k):
-    # rho = electron density at r, Q = array of Q values
-    #S= Q/2*np.pi
-    #not vectorized currently 
-    fQ = []
-    for s in S:
-        integrand =  4*np.pi*(k**3)*rho * r**2 * np.sinc(2*s*r)  # np.sinc(x) = sin(pi x)/(pi x)
-        fQ.append(np.trapz(integrand, r))
-    return pv*np.array(fQ)   #scale by number of electrons in valence
+def core_valence(occ, Z):
+    # identifies core vs valence orbitals
+    orbitals = list(occ.keys())
+    max_n = max(int(o[0]) for o in orbitals)
+    # Main group
+    if Z <= 20 or Z >= 31 and Z <= 36 or Z >= 49 and Z <= 54 or Z >= 81:
+        valence = [o for o in orbitals if int(o[0]) == max_n]
+    else:
+        # Transition / f-block
+        valence = [o for o in orbitals
+                   if int(o[0]) == max_n or int(o[0]) == max_n - 1]
+    core = [o for o in orbitals if o not in valence]
+
+    return core, valence
 
 
-
-def xray_form_factor_core(r,rho,S,pc):
-    fQ = []
-    for s in S:
-        integrand =  4*np.pi*rho * r**2 * np.sinc(2*s*r)  # np.sinc(x) = sin(pi x)/(pi x)
-        fQ.append(np.trapz(integrand, r))
-    return pc*np.array(fQ)
-    
-"""
-
-
-@njit(fastmath=True)
-def _sinc_numba(x):
-    if x == 0.0:
-        return 1.0
-    pix = math.pi * x
-    return math.sin(pix) / pix
+def orb(Z):
+    # gives lists of orbitals, core and valence, pc and pv
+    occ = electron_configuration(Z)
+    core, valence = core_valence(occ, Z)
+    pc = sum(occ[o] for o in core)
+    pv = sum(occ[o] for o in valence)
+    orb = {
+        'orbitals': list(occ.keys()),
+        'core_orbitals': core,
+        'valence_orbitals': valence,
+        'occupation': occ,
+        'pc': pc,
+        'pv': pv
+    }
+    return orb
 
 
-@njit(fastmath=True, parallel=True)
-def _form_factor_kernel(r, rho, S, scale):
+def bunge_R_nl(Z, orbital, r):
     """
-    Multi-threaded Numba kernel.
-    Parallelized over S.
-    Computes:  f_Q(s) = scale * ∫ 4*pi*rho*r^2 * sinc(2*s*r) dr
+    radial orbitals using the parameterisation of Bunge et al
+    Atomic Data and Nuclear Data Tables 53, 113 (1993)
+
+    Each slater-type orbitals sto is given by
+
+    S_jl = N_jl*r^(n_jl-1)*exp(-Z_jl*r)
+
+    where r is distance from nucleus and N_jl is the normalization constant
+
+    N_jl = (2Z_jl)^(n_jl+1/2)/[(2n_jl)!]^1/2
+
+    and
+
+    n_jl is the principal quantum number
+    Z_jl is the orbital exponent
+
+    Total radial function is a superposition of these primitive radial
+    functions multiplied by the expansion coefficent C_jln, i.e.
+    sum over j [C_jln * Sjl]
     """
-    Nr = r.shape[0]
-    Ns = S.shape[0]
 
-    # Precompute base = 4*pi * rho * r^2
-    base = np.empty(Nr, dtype=np.float64)
-    for j in range(Nr):
-        base[j] = 4.0 * math.pi * rho[j] * (r[j] * r[j])
+    C_jln = np.asarray(fu.bunge_coefficients[Z][orbital]['C_jln'])
+    Z_jl = np.asarray(fu.bunge_coefficients[Z][orbital]['Z_jl'])
+    n = np.asarray(fu.bunge_coefficients[Z][orbital]['n'])
 
-    out = np.zeros(Ns, dtype=np.float64)
+    # radial orbital
+    R_nl = np.zeros_like(r, dtype=float)
+    for j in range(len(n)):
+        N_jl = ((2*Z_jl[j])**(n[j]+0.5))/np.sqrt([math.factorial(2*n[j])])
+        R_nl += C_jln[j]*N_jl * r**(n[j]-1) * np.exp(-Z_jl[j]*r)
+        # print(f"{n[j]}, {N_jl}")
 
-    # Parallel loop over S
-    for i in prange(Ns):
-        s = S[i]
-        acc = 0.0
-
-        # manual trapezoid rule along r
-        for j in range(Nr - 1):
-            x1 = 2.0 * s * r[j]
-            x2 = 2.0 * s * r[j+1]
-
-            f1 = base[j]   * _sinc_numba(x1)
-            f2 = base[j+1] * _sinc_numba(x2)
-
-            dr = r[j+1] - r[j]
-            acc += 0.5 * (f1 + f2) * dr
-
-        out[i] = scale * acc
-
-    return out
+    return R_nl
 
 
-def xray_form_factor_valence(r, rho, S, pv, k):
-    r = np.asarray(r, dtype=np.float64)
-    rho = np.asarray(rho, dtype=np.float64)
-    S = np.asarray(S, dtype=np.float64)
+def electron_density(xtal, basis):
+    """
+    Calculates radial electron densities in core and valence shells
+    Uses Bunge parameterisation of Slater-type orbitals (3 < Z < 53)
+    Result is normalized to 1 electron
+    (to be scaled by pv & pc in kappa refinement)
 
-    scale = pv * (k**3)
-    return _form_factor_kernel(r, rho, S, scale)
+    """
+    basis.core = np.zeros([basis.n_atoms, xtal.n_points], dtype=float)
+    basis.valence = np.zeros([basis.n_atoms, xtal.n_points], dtype=float)
+    basis.mean_sq_r2 = np.zeros(basis.n_atoms, dtype=float)
+    r = np.linspace(1e-6, xtal.r_max, xtal.n_points)
 
+    for i in range(basis.n_atoms):
+        Z = basis.atomic_number[i]
+        kappa = basis.kappa[i]
+        n_e_core = 0.0
+        orbi = orb(basis.atomic_number[i])
 
-def xray_form_factor_core(r, rho, S, pc):
-    r = np.asarray(r, dtype=np.float64)
-    rho = np.asarray(rho, dtype=np.float64)
-    S = np.asarray(S, dtype=np.float64)
+        # electron density rho, R_nl^2/4pi
+        rho_core = 0.0
+        for j in orbi['core_orbitals']:
+            n_e_core += orbi['occupation'][j]
+            R = bunge_R_nl(Z, j, r)
+            rho_core += (R**2)/(4*np.pi)
 
-    scale = pc
-    return _form_factor_kernel(r, rho, S, scale)
+        rho_valence = 0.0
+        for j in orbi['valence_orbitals']:
+            R = bunge_R_nl(Z, j, r*kappa)
+            rho_valence += (R**2)/(4*np.pi)
 
+        # normalize to 1 electron (we will scale by pv & pc later)
+        basis.core[i, :] = rho_core / np.trapz(4*np.pi*r**2 * rho_core, r)
+        basis.valence[i, :] = rho_valence / np.trapz(4*np.pi*r**2 *
+                                                     rho_valence, r)
+        basis.pv[i] = orbi["pv"]
+        basis.pc[i] = orbi["pc"]
 
-def precompute_densities(Z, kappa, pv):
-    r_max = 20  # in angstrom
-    n_points = 1000
-    r = np.linspace(1e-6, r_max, n_points)
+        # p_atom(r) in kappa formalism
+        rho_total = (basis.pc[i] * basis.core[i, :]
+                     + basis.pv[i] * basis.valence[i, :] * kappa**3)
 
-    core_orbitals = fu.elements_info[Z]['core_orbitals']
-    valence_orbitals = fu.elements_info[Z]['valence_orbitals']
-    core_density = 0
-    valence_density = 0
+        # atomic charge
+        integrand = 4 * np.pi * rho_total * r**2
+        n_electrons = np.trapz(integrand, r)
+        print(f"    Net charge on atom {basis.atom_label[i]} = {(Z-n_electrons):.2f} electrons")
 
-    n_e_core = 0
-    for orbital in core_orbitals:
-        n_e_core += fu.elements_info[Z]['occupation'][orbital]
-        R = calc_slater_orbitals(Z, orbital, r)
-        core_density += (R**2)
-    core_density /= (4*np.pi)
-    core_density_n = core_density / np.trapz(4*np.pi*r**2*core_density, r)
-    for orbital in valence_orbitals:
-        R = calc_slater_orbitals(Z, orbital, r*kappa)
-        valence_density += (R**2)
-    valence_density /= (4*np.pi)
-    # need to normalize to 1 electron then scale by pv after
-    valence_density_n = valence_density / np.trapz(4*np.pi*r**2*valence_density, r) 
+        # mean square radius of electron density for Ibers formula
+        basis.mean_sq_r2[i] = (np.trapz(r**2*integrand, r) / n_electrons)
 
-    # N_core =  (4*np.pi * np.trapz(r**2 * core_density, r))
-    # N_valence = (4*np.pi * np.trapz(r**2 * valence_density, r))
-    #core_density = (1/(4*np.pi))*(R_core**2)  # this will depend on n,l if multipolar is considered so its more complicate than this , just using this as an example 
-    #valence_density = (1/(4*np.pi))*(R_valence**2)# wavefucniton = R(r)Y_l^m(theta,phi)
+        # plot
+        # fig, ax = plt.subplots(1, 1)
+        # w_f = 10
+        # fig.set_size_inches(w_f, w_f)
+        # plt.plot(r, rho_core, label='core')
+        # plt.plot(r, rho_valence, label='valence')
+        # ax.set_ylim(bottom=1e-06)
+        # ax.set_xlim(left=0)
+        # ax.set_xlabel(r'$r$, Å', size=24)
+        # ax.set_ylabel(r'$\rho$', size=24)
+        # ax.legend(loc='best', bbox_to_anchor=(1, 0.5), fontsize=22)
+        # plt.xticks(fontsize=22)
+        # plt.yticks(fontsize=22)
+        # plt.yscale('log')
+        # plt.title(basis.atom_label[i], fontsize=30)
+        # plt.show()
 
-    pc = fu.elements_info[Z]['pc']
-    # p_atom(r) in kappa formalism
-    density_total = pc*core_density_n + pv*kappa**3*valence_density_n
-    integrand = density_total*np.pi*r**2
-    # mean square radius of electrons in the atom
-    r2_expect = np.trapz(r**2*integrand, x=r)/np.trapz(integrand, x=r)
-    fu.elements_info[Z]["r2"] = r2_expect
-    fu.precomputed_densities[Z] = {
-        "r": r.copy(),
-        "core": core_density_n.copy(),
-        "valence": valence_density_n.copy(),
-        "r2": r2_expect
-        }
+        fig, ax = plt.subplots(1, 1)
+        w_f = 10
+        fig.set_size_inches(w_f, w_f)
+        cd_core = 4*np.pi*rho_core*r*r
+        cd_valence = 4*np.pi*rho_valence*r*r
+        rmax = 300
+        plt.plot(r[:rmax], cd_core[:rmax], label='core')
+        plt.plot(r[:rmax], cd_valence[:rmax], label='valence')
+        # plt.yscale('log')
+        # ax.set_ylim(bottom=1e-06)
+        ax.set_xlim(left=0)
+        ax.set_ylim(top=10)
+        ax.set_xlabel(r'$r$, Å', size=24)
+        ax.set_ylabel(r'Charge density, electrons/Å', size=24)
+        ax.legend(loc='best', fontsize=22)
+        plt.xticks(fontsize=22)
+        plt.yticks(fontsize=22)
+        tit = f"Radial charge density for atom {basis.atom_label[i]}"
+        plt.title(tit, fontsize=24)
+        plt.show()
 
-    return -1
-
-
-def calc_scattering_amplitudes(q, Z, pv, kappa):
-    rho_core = fu.precomputed_densities[Z]["core"]
-    rho_val = fu.precomputed_densities[Z]["valence"]
-    r = fu.precomputed_densities[Z]["r"]
-    pc = fu.elements_info[Z]['pc']
-    # precomputed densities
-    f_valence = xray_form_factor_valence(r, rho_val, q, pv, kappa)
-    f_core = xray_form_factor_core(r, rho_core, q, pc)
-    # fourier transform of the calculated radial funciton in 3d from 0 to inf
-    f_x_total = f_core + f_valence
-
-    return f_x_total
-
-
-def convert_x(Z, f_x, q):
-    Bohr = 0.52917721067  # in angstrom
-    q = np.asarray(q)
-    f_x = np.asarray(f_x)
-
-    # Output array
-    f_e = np.zeros_like(q, dtype=float)
-
-    # Mask where q == 0
-    mask0 = (q == 0)
-    maskN = ~mask0  # q ≠ 0
-
-    # Special case for q = 0 (Ibers correction)
-    r2 = fu.elements_info[Z]["r2"]
-    f_e[mask0] = (Z * r2) / (3 * Bohr)
-
-    # Mott–Bethe formula
-    f_e[maskN] = (Z - f_x[maskN]) / (2 * np.pi**2 * Bohr * q[maskN]**2)
-
-    return f_e
+    return
 
 
-# need to carefully look through and fix scaling of function
-# close but not quite
-def kappa_factors(g, Z, pv, kappa):
-    orig_shape = g.shape
-    g_flat = g.flatten()
-    S = g_flat / (2*np.pi)
-    f_out = np.zeros_like(g_flat, dtype=float)
-    f_out = convert_x(Z, calc_scattering_amplitudes(S, Z, pv, kappa), S)
+def f_kappa(xtal, basis, g_pool_mag, i):
+    """
+    Calculates an array of electron scattering factors using
+    the kappa formalism, over values in g_pool_mag.
+    We first obtain the X-ray scattering factor by integrating
+    ∫ 4*pi*rho*r^2 * sinc(2*s*r) dr from 0 upwards, where rho is electron
+    density
 
-    return f_out.reshape(orig_shape)
-# should handle values below 0.5 Q using kirkland values or some type of extrapolation
+    g_pool_mag : 1d float array of g magnitudes,
+    i : index of atom in the basis
+
+    Returns
+    f_kappa : structure factors to match g,
+    size [n_hkl, n_hkl]
+
+    """
+
+    # physics to crystallographic convention
+    # my g = 2*pi*g' where g' is the crystallographic convention
+    # x-ray structure factors are given in s = sin(theta)/lambda = 1/2d =g'/2
+    # so s = g/(4*pi)
+    s = g_pool_mag / (4*np.pi)
+
+    # array in real space to calculate integral
+    # may need more points at small r?
+    r = np.linspace(1e-6, xtal.r_max, xtal.n_points)
+
+    # integrate to get the structure factor
+    # NB we use sinc(qr) = sinc(2sr) ???
+    qr = 2 * np.outer(s, r)
+    base_core = 4.0 * np.pi * basis.core[i] * np.sinc(qr) * r**2
+    base_val = 4.0 * np.pi * basis.valence[i] * np.sinc(qr) * r**2
+    f_x_core = basis.pc[i] * np.trapz(base_core, r, axis=1)
+    f_x_valence = basis.pv[i] * np.trapz(base_val, r, axis=1)
+    f_x = f_x_core + f_x_valence
+
+    f_kappa = np.zeros_like(g_pool_mag, dtype=float)
+
+    # g ≠ 0, the Mott-Bethe conversion
+    mask = (g_pool_mag != 0)
+    f_kappa[mask] = xtal.mott*(basis.atomic_number[i] -
+                               f_x[mask]) / (s[mask]**2)
+    # g = 0 (Ibers formula)
+    f_kappa[0] = (basis.atomic_number[i] *
+                  basis.mean_sq_r2[i]) / (3 * xtal.bohr_radius)
+
+    fig, ax = plt.subplots(1, 1)
+    w_f = 10
+    fig.set_size_inches(w_f, w_f)
+    smax = 1000
+    plt.plot(s[:smax], f_kappa[:smax], label='$f_e$')
+    plt.plot(s[:smax], f_x[:smax], label='$f_X$')
+    # plt.yscale('log')
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=0)
+    # ax.set_ylim(top=10)
+    ax.set_xlabel(r'$s$ /Å', size=24)
+    ax.set_ylabel(r'$f$', size=24)
+    ax.legend(loc='best', fontsize=22)
+    plt.xticks(fontsize=22)
+    plt.yticks(fontsize=22)
+    tit = f"Scattering factor for atom {basis.atom_label[i]}"
+    plt.title(tit, fontsize=24)
+    plt.show()
+
+    return f_kappa
 
 
 def four_gauss(s, a):
@@ -1782,27 +1850,15 @@ def four_gauss(s, a):
     sum of four Gaussians & a constant for Thomas f_prime
     s : float, sin(theta)/lambda, can be an array [n_hkl, n_hkl]
     a : array of floats size [9] from Thomas look up table
-    
     Returns : f_prime, array [n_hkl, n_hkl], the imaginary part of the
     scattering factor
     """
-    # f = a[0]*np.exp(-abs(a[1])*s**2) + \
-    #     a[2]*np.exp(-abs(a[3])*s**2) + \
-    #     a[4]*np.exp(-abs(a[5])*s**2) + \
-    #     a[6]*np.exp(-abs(a[7])*s**2) + a[8]
     f = (a[..., 0] * np.exp(-np.abs(a[..., 1]) * s**2) +
          a[..., 2] * np.exp(-np.abs(a[..., 3]) * s**2) +
          a[..., 4] * np.exp(-np.abs(a[..., 5]) * s**2) +
          a[..., 6] * np.exp(-np.abs(a[..., 7]) * s**2) +
          a[..., 8])
     return f
-
-    # f = (a[..., 0]*np.exp(-abs(a[..., 1])*s[..., 0]**2) +
-    #     a[..., 2]*np.exp(-abs(a[..., 3])*s[..., 1]**2) +
-    #     a[..., 4]*np.exp(-abs(a[..., 5])*s[..., 2]**2) +
-    #     a[..., 6]*np.exp(-abs(a[..., 7]) *
-    #                         (s[..., 0]**2+s[..., 1]**2+s[..., 2]**2)) +
-    #     a[..., 8])
 
 
 def f_thomas(g, B, Z, v):
@@ -2044,42 +2100,48 @@ def parabo3(x, y):
     return x_v, y_v
 
 
-def convex(r3_x, r3_y):
-    # Checks the three points coming in to see if a parabolic fit for a
-    # minimum is possible.  If so, returns the predicted minimum (minny=True).
-    # If not, returns the next point to check (minny=False).
+def convex(x, y):
+    # Checks three points (x = variable, y = figure of merit) to see if a
+    # parabolic fit to a minimum is possible.  If so, returns the predicted
+    # minimum. If not, returns the next x to check (both cases, minny=False).
+    # Looks to see if we have captured a minimum (minny=True).
+
     tol = 1e-10
-    x_max = np.argmax(r3_x)  # index of lowest x
-    x_min = np.argmin(r3_x)  # index of highest x
-    if r3_x[x_max] - r3_x[x_min] > tol:
-        x_mid = 3 - x_max - x_min  # index of mid x
-        if r3_x[x_max] - r3_x[x_mid] > tol and r3_x[x_mid] - r3_x[x_min] > tol:
-            convexity_test = -abs(r3_y[x_max] - r3_y[x_min])
-            # convexity is y at the mid x
-            # if there was a straight line between lowest and highest x
-            convexity = r3_y[x_mid] - (
-                r3_y[x_min] + (r3_x[x_mid] - r3_x[x_min]) *
-                (r3_y[x_max] - r3_y[x_min]) /
-                (r3_x[x_max] - r3_x[x_min]))
-        else:
-            raise ValueError("Parabolic refinement failed")
+    hi = np.argmax(x)  # index of lowest x
+    lo = np.argmin(x)  # index of highest x
+    mid = 3 - hi - lo  # index of mid x
+    x_half = 0.5*(x[hi] + x[lo])   # half way x point
+    if x[mid] < x_half:  # central point is between lo and half
+        y_half = y[lo] + (y[mid] - y[lo]) * (x_half-x[lo])/(x[mid]-x[lo])
     else:
-        raise ValueError("Parabolic refinement failed")
-    if convexity > 0.1 * convexity_test:
+        y_half = y[hi] + (y[mid] - y[hi]) * (x[hi]-x_half)/(x[hi]-x[mid])
+
+    # check for no change in the figure of merit
+    if abs(y[hi] - y[lo]) < tol:
+        return x[mid], True
+
+    # check for mimimum capture
+    minny = False
+    if y[mid] < y[hi] and y[mid] < y[lo]:
+        minny = True
+
+    # convexity is the difference between y_half
+    # and a straight line between y[lo] and y[hi]
+    convexity = y_half - 0.5*(y[hi] + y[lo])
+
+    if convexity > -0.1 * abs(y[hi] - y[lo]):
         # find the size of the step between the two lowest y
-        y_max = np.argmax(r3_y)  # index of highest y
-        y_min = np.argmin(r3_y)  # index of lowest y
+        y_max = np.argmax(y)  # index of highest y
+        y_min = np.argmin(y)  # index of lowest y
         y_mid = 3 - y_max - y_min  # index of mid y
-        last_dx = r3_x[y_min] - r3_x[y_mid]
+        last_dx = x[y_min] - x[y_mid]
         # use exp to give an irrational step size and avoid going to the same
         # point twice, exp(0.75)~=2.12
-        next_x = r3_x[y_min] + np.exp(0.75) * last_dx
-        minny = False
+        next_x = x[y_min] + np.exp(0.75) * last_dx
         print(f"Convex, will contine to {next_x:.5f}")
     else:
-        next_x, next_y = parabo3(r3_x, r3_y)
-        print(f"Concave, predict minimum at {next_x:.4f} with fit index {100*next_y:.2f}%")
-        minny = True
+        next_x, next_y = parabo3(x, y)
+        print(f"Concave, predict minimum at {next_x:.5f} with fit index {100*next_y:.2f}%")
 
     return next_x, minny
 
